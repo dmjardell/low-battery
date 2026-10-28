@@ -1,0 +1,7 @@
+[Unit]
+Description=Check laptop battery and handle low battery
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/low-battery.sh
+TimeoutStartSec=90s
