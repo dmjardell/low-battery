@@ -6,13 +6,17 @@ set -euo pipefail
 # User configuration
 # ==========================================
 
-readonly BATTERY_THRESHOLD=20
+readonly BATTERY_THRESHOLD=15
 readonly LOW_BATTERY_ACTION="suspend"  # suspend or shutdown
-readonly WARNING_SECONDS=90
+readonly WARNING_SECONDS=60
+readonly COOLDOWN_SECONDS=5400        # 90 minutes
 
 # ==========================================
-# Prevent concurrent instances
+# Directories and locking
 # ==========================================
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/low-battery"
+mkdir -p "$STATE_DIR"
 
 LOCK_FILE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/low-battery.lock"
 
@@ -23,8 +27,63 @@ if ! flock -n 9; then
     exit 0
 fi
 
-# Keep file descriptor 9 open for the entire script.
-# The lock is released automatically when the script exits.
+# ==========================================
+# Check external power source
+# ==========================================
+
+is_plugged_in() {
+    local supply type online
+
+    for supply in /sys/class/power_supply/*; do
+        [[ -f "$supply/type" ]] || continue
+        [[ -r "$supply/online" ]] || continue
+
+        type=$(<"$supply/type")
+
+        case "$type" in
+            Mains|USB|USB_C|USB_PD|USB_PD_DRP|Wireless)
+                online=$(<"$supply/online")
+
+                if [[ "$online" == "1" ]]; then
+                    return 0
+                fi
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+if is_plugged_in; then
+    echo "External power detected. No action required."
+    exit 0
+fi
+
+echo "Laptop running on battery."
+
+# ==========================================
+# Check cancellation cooldown
+# ==========================================
+
+COOLDOWN_FILE="$STATE_DIR/cooldown"
+
+if [[ -f "$COOLDOWN_FILE" ]]; then
+    last_abort=$(<"$COOLDOWN_FILE")
+    now=$(date +%s)
+
+    if [[ "$last_abort" =~ ^[0-9]+$ ]] &&
+       (( now < last_abort )); then
+        echo "Cancellation cooldown active. Exiting."
+        exit 0
+    fi
+
+    if [[ "$last_abort" =~ ^[0-9]+$ ]] &&
+       (( now - last_abort < COOLDOWN_SECONDS )); then
+        remaining=$((COOLDOWN_SECONDS - (now - last_abort)))
+        echo "Cancellation cooldown active. ${remaining}s remaining."
+        exit 0
+    fi
+fi
 
 # ==========================================
 # Read battery percentage
@@ -55,30 +114,25 @@ get_battery_percentage() {
 # ==========================================
 
 if (( BATTERY_THRESHOLD < 0 || BATTERY_THRESHOLD > 100 )); then
-    echo "Error: BATTERY_THRESHOLD must be 0-100." >&2
-    exit 1
-fi
-
-if (( WARNING_SECONDS < 1 )); then
-    echo "Error: WARNING_SECONDS must be positive." >&2
+    echo "Invalid battery threshold." >&2
     exit 1
 fi
 
 if [[ "$LOW_BATTERY_ACTION" != "suspend" &&
       "$LOW_BATTERY_ACTION" != "shutdown" ]]; then
-    echo "Error: Invalid LOW_BATTERY_ACTION." >&2
+    echo "Invalid action." >&2
     exit 1
 fi
 
 if ! currentBatteryPercentage=$(get_battery_percentage); then
-    echo "Error: Could not read battery percentage." >&2
+    echo "Could not read battery percentage." >&2
     exit 1
 fi
 
 echo "Battery: ${currentBatteryPercentage}%"
 
 if (( currentBatteryPercentage >= BATTERY_THRESHOLD )); then
-    echo "Battery above threshold; no action."
+    echo "Battery above threshold. No action."
     exit 0
 fi
 
@@ -99,49 +153,55 @@ Click 'Cancel action' to abort."
 
 echo "$warning_message"
 
-cancelled=false
-
-if [[ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]] &&
-   command -v zenity >/dev/null 2>&1; then
-
-    # One button only: clicking it cancels the action.
-    # Timeout closes the dialog and allows the action to proceed.
-    if zenity --info \
-        --title="Low battery warning" \
-        --text="$warning_message" \
-        --ok-label="Cancel action" \
-        --timeout="$WARNING_SECONDS"; then
-        cancelled=true
-    fi
-else
-    # Terminal fallback. No graphical session is available.
-    echo "Press c then Enter within ${WARNING_SECONDS} seconds to cancel."
-
-    if IFS= read -r -t "$WARNING_SECONDS" -p "> " response; then
-        if [[ "$response" == "c" || "$response" == "C" ]]; then
-            cancelled=true
-        fi
-    fi
+# Require a graphical prompt in the scheduled session.
+if ! command -v zenity >/dev/null 2>&1 ||
+   [[ -z "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]]; then
+    echo "Cannot display warning dialog. Taking no action." >&2
+    exit 1
 fi
 
-if [[ "$cancelled" == true ]]; then
+# ==========================================
+# Cancellation window
+# ==========================================
+
+if zenity --info \
+    --title="Low battery warning" \
+    --text="$warning_message" \
+    --ok-label="Cancel action" \
+    --timeout="$WARNING_SECONDS"; then
+
     echo "Action cancelled by user."
+
+    # Store cooldown expiration timestamp.
+    now=$(date +%s)
+    expiry=$((now + COOLDOWN_SECONDS))
+
+    temp_file=$(mktemp "$STATE_DIR/cooldown.XXXXXX")
+    printf '%s\n' "$expiry" > "$temp_file"
+    mv "$temp_file" "$COOLDOWN_FILE"
+
+    echo "Next warning permitted in 90 minutes."
     exit 0
 fi
 
 # ==========================================
-# Recheck battery after warning
+# Recheck power and battery
 # ==========================================
 
+if is_plugged_in; then
+    echo "External power connected. Aborting action."
+    exit 0
+fi
+
 if ! currentBatteryPercentage=$(get_battery_percentage); then
-    echo "Error: Could not re-read battery; taking no action." >&2
+    echo "Could not re-read battery. Taking no action." >&2
     exit 1
 fi
 
 echo "Battery after warning: ${currentBatteryPercentage}%"
 
 if (( currentBatteryPercentage >= BATTERY_THRESHOLD )); then
-    echo "Battery recovered; no action."
+    echo "Battery recovered. No action."
     exit 0
 fi
 
